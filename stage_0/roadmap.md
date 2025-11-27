@@ -74,7 +74,7 @@
 2. torch的常见操作
 3. （单卡）训练需要的组件和概念
     - `dataloader`、模型、`optimizer`、`loss`、`forwoard`、`backward`、`optimizer.step`、模型权重（checkpoint）
-4. 所谓的模型是一个有向无环图，这个图叫计算图，每个节点是一个计算过程（`Function`或者说`Layer`或者是`Module`）和输入输出与权重（`Tensor`）和梯度（`grad`）
+4. 所谓的模型是一个有向无环图，这个图叫计算图，每个节点是一个计算过程（`Function`或者说`Layer`或者是`Module`）和输入输出与权重（`Tensor`）和梯度（`grad`），节点之间边的方向是fwd时的运算顺序
     - `数据tensor`为`src`，`loss`为`tgt`
     - 所谓的`forward`(之后简称fwd)是从`src`开始执行到`tgt`，不断执行每个节点的fwd，每个节点的fwd都是前驱节点的fwd结果
     - 所谓的`backward`(之后简称bwd)是从`tgt`执行到`src`，不断执行每个节点的bwd方法，每个bwd的输入是后继节点的bwd结果，后继节点的bwd结果存在当前节点fwd输出tensor（=后继节点fwd输入）的`.grad`中
@@ -87,9 +87,9 @@
 ![](https://littlenyima-1319014516.cos.ap-beijing.myqcloud.com/blog/2025/08/31/process-of-model-training.jpg)：
 
 ```python
-dataloader = Dataloader(...)
-model = Module(...)
-loss_fn = Loss(...)
+dataloader = Dataloader(...) # 负责从某存储读取数据并打包为训练数据，我们先不管他
+model = Module(...) # 模型定义，我们先不考虑模型具体形态
+loss_fn = Loss(...) # loss函数的定义
 optimizer = torch.optim.Adam(model.parameters(), ...) # 注意model.parameters()是要更新的模型权重的集合
 
 def train_loop(dataloader, model, loss_fn, optimizer):
@@ -111,7 +111,7 @@ def train_loop(dataloader, model, loss_fn, optimizer):
         # 权重更新完了，清空所有tensor的grad，准备下一轮
         optimizer.zero_grad()
 
-        # 我们把这个训练里的过程叫做“一个训练step”
+        # 我们把这个训练循环里的单次迭代，叫做“一个训练step”
 
 ```
 
@@ -120,11 +120,31 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 
 #### 拓展到单机多卡和多机多卡
 
-我们已经了解了单卡训练的最小方式，那么我们问问伟大的gpt老师，把这个过程拓展到单机多卡（ddp）和多机多卡（ddp）
+我们已经了解了单卡训练的最小方式，那么我们可以问问伟大的gpt老师，怎样把这个过程拓展到单机多卡（ddp）和多机多卡（ddp），代码可以是一致的
+
+[参考这个训练代码](./ddp.py)，使用方式在代码中
+
+我们可以先看看和单卡最小训练相比，多了什么东西呢？
+
+- 启动方式变了，变成了[torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html)，并且输入的时候有一些参数
+- 变成多进程，看起来一个进程会使用一张卡
+- 除了单卡有的之外，还多了[torch distributed](https://docs.pytorch.org/docs/stable/distributed.html)的init等处理
+- Dataloader多了[DistributedSampler](https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler)
+- 代码里面多了一堆读取的环境变量，多了`rank`的概念
+- 代码里面model包了一层[DistributedDataParallel](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel)
+    - 这是啥呢
+
+好，我们先到这里，在此之前我们先想办法看看，单卡和多卡的训练step分别发生了什么吧
+
+#### 使用profiler工具了解每个训练steo过程
 
 TODO
 
-#### 使用profiler工具了解每个训练steo过程
+#### 集合通信
+
+TODO
+
+#### 3D并行
 
 TODO
 
