@@ -58,7 +58,8 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, 
     running_loss = 0.0
     correct = 0
     total = 0
-    for images, targets in loader:
+\
+    for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -70,11 +71,14 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, 
         loss.backward()
 
         optimizer.step()
+        
+        torch.cuda.synchronize()
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(outputs, 1)
         correct += (preds == targets).sum().item()
         total += targets.size(0)
+    
     avg_loss = running_loss / max(total, 1)
     acc = correct / max(total, 1)
     return avg_loss, acc
@@ -125,7 +129,12 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.num_workers, pin_memory=pin_memory)
 
     model = build_model().to(device)
-    ddp_model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)
+    ddp_model = DDP(
+        model,
+        device_ids=[local_rank] if device.type == "cuda" else None,
+        output_device=local_rank if device.type == "cuda" else None,
+        bucket_cap_mb=1024 * 1024,  # no bucket
+    )
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(ddp_model.parameters(), lr=1e-3)
