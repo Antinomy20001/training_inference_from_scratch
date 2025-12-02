@@ -150,7 +150,7 @@ def main():
         prof_schedule = profiler.schedule(wait=2, warmup=3, active=prof_steps)
         prof = profiler.profile(
                 schedule=prof_schedule,
-                on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
+                # on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=True)
@@ -167,7 +167,8 @@ def main():
                   f"| train_acc {train_acc:.4f} | test_acc {test_acc:.4f}")
         if prof and epoch == 1:       # 录完第一个 epoch 就停
             prof.stop()
-            prof = None
+            prof.export_chrome_trace(f"/tmp/trace_{dist.get_rank()}.json")
+            del prof
     if rank == 0:
         os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
         torch.save(ddp_model.module.state_dict(), args.save_path)
