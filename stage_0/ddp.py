@@ -60,8 +60,7 @@ def setup_dist():
     return backend, rank, world_size, local_rank, device
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch,
-                    profiler_obj=None, max_prof_steps=None):
+def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -81,12 +80,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch,
         _, preds = torch.max(outputs, 1)
         correct += (preds == targets).sum().item()
         total   += targets.size(0)
-
-        # ----  profiler step ----
-        if profiler_obj is not None:
-            profiler_obj.step()
-            if step + 1 >= max_prof_steps:      # 录够就停
-                break
 
     avg_loss = running_loss / max(total, 1)
     acc      = correct / max(total, 1)
@@ -119,10 +112,7 @@ def main():
     parser.add_argument("--data-dir", type=str, default="/tmp/data")
     parser.add_argument("--save-path", type=str, default="/tmp/resnet18_mnist_ddp_multi_node.pth")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--profiler", action="store_true", help="enable PyTorch Profiler on rank 0")
-    parser.add_argument("--profiling-steps", type=int, default=20, help="how many train steps to record")
-    parser.add_argument("--profiling-dir", type=str, default="./log_prof", help="tensorboard trace folder")
+    parser.add_argument("--num-workers", type=int, default=1)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -148,33 +138,22 @@ def main():
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(ddp_model.parameters(), lr=1e-3)
-    prof, prof_steps = None, 0
-    if args.profiler and rank == 0:
-        prof_steps = args.profiling_steps
-        prof_schedule = profiler.schedule(wait=2, warmup=3, active=prof_steps)
-        prof = profiler.profile(
-            schedule=prof_schedule,
-            # on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        )
-        prof.start()    
+    optimizer = optim.Adam(ddp_model.parameters(), lr=1e-3) 
 
     for epoch in range(1, args.epochs + 1):
         train_sampler.set_epoch(epoch)
         train_loss, train_acc = train_one_epoch(
-                ddp_model, train_loader, criterion, optimizer,
-                device, epoch, prof, prof_steps)
+            ddp_model, 
+            train_loader, 
+            criterion, 
+            optimizer,
+            device
+        )
         test_acc = evaluate_global(ddp_model, test_loader, device)
         if rank == 0:
             print(f"Epoch {epoch}/{args.epochs} | loss {train_loss:.4f} "
                   f"| train_acc {train_acc:.4f} | test_acc {test_acc:.4f}")
-        if prof and epoch == 1:       # 录完第一个 epoch 就停
-            prof.stop()
-            prof.export_chrome_trace(f"/tmp/trace_{dist.get_rank()}.json")
-            del prof
+
     if rank == 0:
         os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
         torch.save(ddp_model.module.state_dict(), args.save_path)
