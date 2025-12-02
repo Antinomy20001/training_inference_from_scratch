@@ -140,7 +140,12 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.num_workers, pin_memory=pin_memory)
 
     model = build_model().to(device)
-    ddp_model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)
+    ddp_model = DDP(
+        model, 
+        device_ids=[local_rank] if device.type == "cuda" else None, 
+        output_device=local_rank if device.type == "cuda" else None,
+        bucket_cap_mb=1024 * 1024 * 114514,  # no bucket
+    )
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(ddp_model.parameters(), lr=1e-3)
@@ -149,11 +154,12 @@ def main():
         prof_steps = args.profiling_steps
         prof_schedule = profiler.schedule(wait=2, warmup=3, active=prof_steps)
         prof = profiler.profile(
-                schedule=prof_schedule,
-                # on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True)
+            schedule=prof_schedule,
+            # on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
         prof.start()    
 
     for epoch in range(1, args.epochs + 1):
