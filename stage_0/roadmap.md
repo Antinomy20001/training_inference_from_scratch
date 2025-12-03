@@ -1,6 +1,6 @@
 # 训练与推理的优化
 
-## 在做什么？
+# 在做什么？
 
 <del>就是优化训练和推理</del>
 
@@ -16,7 +16,7 @@
     - 由于`模型权重`无需更新，所以用来更新`模型权重`的组件也不存在
 
 
-## 需要知道什么？
+# 需要知道什么？
 
 - 模型的计算过程（可以不知道算法或数学意义的过程）
 - 给定硬件条件的性能边界（以及什么叫“性能”）
@@ -25,7 +25,7 @@
 - 良好的coding功底（做模拟题，把想法快速实现出来，一般不涉及到复杂的语言特性）
 - Python基础
 
-## 一些时代背景
+# 一些时代背景
 
 1. 现在是5202年
     - 除了LLM（及其衍生mllm、vlm、扩散模型、dit、wm、vla、lrm等）基本可以开除ai籍
@@ -48,13 +48,13 @@
         - 例如，单个node故障率哪怕只有0.01%，在233个node持续以榨干性能的姿态运行长时间的情况下，故障率可以接近100%
     - 分布式共识反而不会成为问题，CAP不可能三角中可以最大化可用性和容忍性，几乎可以不考虑一致性，因为分布式训推的并行策略已经可以事先对数据进行schedule
 
-## Roadmap
+# Roadmap
 
-### Common
+## Common
 
 训推都需要知道的知识
 
-#### torch的基本使用和单卡最小训练过程
+### torch的基本使用和单卡最小训练过程
 
 学会torch的官方教程，https://docs.pytorch.org/tutorials/beginner/basics/intro.html
 
@@ -118,7 +118,7 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 此时，我们完全不需要知道model的算法细节，只需要知道他是一个model
 
 
-#### 拓展到单机多卡和多机多卡
+### 拓展到单机多卡和多机多卡
 
 我们已经了解了单卡训练的最小方式，那么我们可以问问伟大的gpt老师，怎样把这个过程拓展到单机多卡（ddp）和多机多卡（ddp），代码可以是一致的
 
@@ -136,9 +136,9 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 
 好，我们先到这里，在此之前我们先想办法看看，单卡和多卡的训练step分别发生了什么吧
 
-#### 使用profiler工具了解每个训练steo过程发生了什么
+### 使用profiler工具了解每个训练steo过程发生了什么
 
-##### 跑一个profiler文件
+#### 跑一个profiler文件
 
 你已经学会跑`ddp.py`了，所以可以把`stage_0/ddp_with_profiler.py`也跑了，自己看懂参数跑一下
 
@@ -152,30 +152,22 @@ cpu活动中会有我们这份代码中ddp的详细堆栈，我们可以放大�
 
 TODO: 现象描述和对比
 
-#### GPU的基本概念
+### GPU的基本概念
 
 TODO
 
-#### 集合通信
+### 集合通信
 
 TODO
 
-#### 3D并行
+### 3D并行
 
 TODO
 
-#### huggingface
+### huggingface
 
 一般习惯性把`diffusers`、`transformers`称为“hf”，可以认为是LLM时代的RFC，这两个库有常见LLM的模型实现（modeling）和基本训练过程封装，性能很感人，但是大家的各种优化都会把hf作为对齐效果的目标
 
 我们先以`transformers`为例
-
-TODO
-
-### 推理
-
-TODO
-
-### 训练
 
 TODO
