@@ -22,6 +22,8 @@ def build_model(num_classes: int = 10) -> nn.Module:
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
+        dist.barrier()
+        train_dataset = datasets.MNIST(root=data_dir, 
 
 def get_datasets_ddp(data_dir: str, rank: int):
     transform = transforms.Compose([
@@ -32,9 +34,7 @@ def get_datasets_ddp(data_dir: str, rank: int):
         train_dataset = datasets.MNIST(root=data_dir, train=True, transform=transform, download=True)
         test_dataset = datasets.MNIST(root=data_dir, train=False, transform=transform, download=True)
         dist.barrier()
-    else:
-        dist.barrier()
-        train_dataset = datasets.MNIST(root=data_dir, train=True, transform=transform, download=False)
+    else:train=True, transform=transform, download=False)
         test_dataset = datasets.MNIST(root=data_dir, train=False, transform=transform, download=False)
     return train_dataset, test_dataset
 

@@ -126,15 +126,12 @@ def main():
 
     torch.backends.cudnn.benchmark = True
 
-    backend, rank, world_size, local_rank, device = setup_dist()
+    _, rank, world_size, local_rank, device = setup_dist()
     pin_memory = device.type == "cuda"
 
-    train_dataset, test_dataset = get_datasets_ddp(args.data_dir, rank)
+    train_dataset, _ = get_datasets_ddp(args.data_dir, rank)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.num_workers, pin_memory=pin_memory)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.num_workers, pin_memory=pin_memory)
 
     model = build_model().to(device)
     ddp_model = DDP(

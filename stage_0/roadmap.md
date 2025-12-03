@@ -122,7 +122,7 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 
 我们已经了解了单卡训练的最小方式，那么我们可以问问伟大的gpt老师，怎样把这个过程拓展到单机多卡（ddp）和多机多卡（ddp），代码可以是一致的
 
-[参考这个训练代码](./ddp.py)，使用方式在代码中
+[参考这个训练代码](./codes/ddp.py)，使用方式在代码中
 
 我们可以先看看和单卡最小训练相比，多了什么东西呢？
 
@@ -140,17 +140,19 @@ def train_loop(dataloader, model, loss_fn, optimizer):
 
 #### 跑一个profiler文件
 
-你已经学会跑`ddp.py`了，所以可以把`stage_0/ddp_with_profiler.py`也跑了，自己看懂参数跑一下
+你已经学会跑`ddp.py`了，所以可以把[ddp_with_profiler.py](./codes/ddp_with_profiler.py)也跑了，自己看懂参数跑一下
 
-跑完后会在`/tmp/`下生成若干个`trace_*.json`，然后运行`stage_0/merge_profiler.py`(ai写的)，会得到`/tmp/trace_merged.json`, 我们把这个merge json丢到[perfetto.dev](https://ui.perfetto.dev/)中打开
+跑完后会在`/tmp/`下生成若干个`trace_*.json`，然后运行[merge_profiler.py](./code/merge_profiler.py)(ai写的)，会得到`/tmp/trace_merged.json`, 我们把这个merge json丢到[perfetto.dev](https://ui.perfetto.dev/)中打开
 
 我们在timeline的最左边，会发现有stream和thread两种timeline，分别对应gpu和cpu的活动。
 
 cpu活动中会有我们这份代码中ddp的详细堆栈，我们可以放大，在尾巴里找到有`cudaLaunchKernel`的cpu活动，会发现他有一条曲线连在gpu活动，表示对应关系。
 
-然后我们在单卡训练也这样做一个profiler，放到新的perfetto窗口打开
+然后我们在单卡训练也这样做一个profiler，放到新的perfetto窗口打开，perfetto按`A/D`是左右平移，按`W/S`是按中心大小缩放，更详细的用法以及sql查询请问gpt老师，我们大部分情况下最多只需要按名字搜索某个活动（在perfetto里面叫event）
 
-TODO: 现象描述和对比
+在`assets`里面分别准备了在H20上的[单卡](../assets/stage_0/perfetto/trace_single.json.gz)和[2卡ddp](../assets/stage_0/perfetto/ddp_2ranks.json.gz)的profiler，我们以这两个为例，放到perfetto后分别形如
+
+
 
 ### GPU的基本概念
 
