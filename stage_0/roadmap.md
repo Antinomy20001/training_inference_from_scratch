@@ -177,7 +177,26 @@ cpu活动中会有我们这份代码中ddp的详细堆栈，我们可以放大�
     - 而且nccl的stream和计算的stream不是同一个
     - **这样的kernel是负责通信的**
 
-WIP
+除此之外，gpu的活动的timeline计算部分非常稀疏，存在很多空泡，因为这是timeline，空泡一定是没有活动
+
+且通信部分一个rank特别长，另一个短很多，但通信又基本上是同时结束的
+
+我们再看看cpu部分：
+
+![](../assets/stage_0/images/cpu_overhead.png)
+
+显然有明显的从上到下调用关系，活动的名字是`文件路径(行数): function名`格式，并且看起来，最底层都是一个`cuda runtime`的活动，即命名都是`cudaXXXXXX`
+
+好了，我们先看到这，还有很多可以挖掘的信息，但我们先解决一下我们这里提到的一些问题
+
+- 拓展项：
+    - [ddp_with_profiler.py](./codes/ddp_with_profiler.py)的训练过程多了一些东西：
+        - `dist.barrier()`
+        - `torch.cuda.synchronize()`
+        - `record_function`
+        - warmup
+    - 有兴趣的话可以问问gpt他们的用处，以及为什么我们在profiler的时候用了这些功能
+    - 我们后面会讲到
 
 ### GPU的基本概念
 
