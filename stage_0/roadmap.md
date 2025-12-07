@@ -204,6 +204,165 @@ TODO
 
 ### 集合通信
 
+我们在profiler里看到了`ncclDevKernel_AllReduce_Sum_f32_RING_LL`这个kernel，显然有格式：
+- `ncclDevKernel`: 我们忽略DevKernel，`nccl`是NVIDIA Collective Communications Library，是NVIDIA在NV GPU上的集合通信库，所以这个kernel来自这个集合通信库
+- `AllReduce`：这是一种通信原语，表示这个kernel执行的是这种通信原语。**后面的都是这个原语的参数**
+    - `Sum`： 求和，为什么这里有个求和呢？
+    - `f32`：显然是数据类型fp32，但为什么这里有个数据类型？
+    - `RING`：为什么有“环“这个词出现？
+    - `LL`：我可以先剧透，这个简称是指Low Latency，但这具体是什么呢？
+
+`nccl`看起来就是个名词，没什么好说的，但是`AllReduce`这种通信原语是什么呢，通信原语有哪些呢，以及，什么叫“集合通信“呢？为什么有“集合“两个字？
+
+#### 必要概念
+
+以目前的实践方式来说，我们会默认：
+- 一个`gpu` = 一个`进程`(实践上) = 一个`rank` = 一个`device`
+- 一个`机器` = 一个`Node` = 若干个`gpu`（一般是8-10）
+- 一个`集群` = 若干`机器` + 机器之间的网络拓扑 + 每个机器的device之间的网络拓扑
+
+rank是指gpu中的编号，比如有n张卡，那么rank范围是$[0, n)$，同时这里的$n$也是world size
+
+所以一个rank也会区分是“全部机器的全部gpu”的`global rank`，还有本地机器的`local rank`，默认我们都认为`rank = global rank`
+
+此外，在一些场景中需要计算某个`Node`在所有`Node`中的编号，再计算出实际的`device`的`rank`，所以也会有`node rank`，但总之，没有特意指明时，`rank`就是`device`的`global rank`
+
+#### 集合通信与点对点通信
+
+我们熟悉的通信比如socket，会有send和recv，我们把这样的通信称为：`点对点通信 (P2P)`，只需要两者约定好即可，像是游戏里的私聊。
+
+所谓的集合通信，是指有多个通信参与者，约定好一个通信原语，完成后各自获得某种结果。
+
+就像：有多个人，预定了一个聊天室，约定了一个讨论内容，每人完成自己负责的部分，最后大家拿着讨论结果走人。
+
+注意我们接下来默认：一个通信参与者 = 一个rank = 一个进程
+
+- 点对点通信：rank $i$明确发送信息给rank $j$，rank $j$明确的接受从rank $i$发送的信息
+
+例如同一时间，rank $i$的进程中明确执行了代码：
+
+```python
+send(message, j)
+```
+
+而rank $j$的进程明确的执行了代码：
+
+```python
+message = recv(i)
+```
+
+
+- 集合通信：rank $i,j,k,z$约定一起参与通信，每个rank的进程都会负责同样的发送或者接受的行为顺序，最后rank $i,j,k,z$都获得了这种约定的结果。
+
+比如rank $i,k,k,z$的进程都执行了代码：
+
+```python
+result = collective_communication_op(message, [i, j, k, z])
+```
+
+所以我们在coding时需要预先设置好：
+
+- 点对点通信的规则
+- 参与集合通信的rank集合，以及约定了什么样的通信
+
+这是类似“编译期”需要指定的内容，如果有“运行时”的更改，那么也需要通过通信机制让所有进程感知，但这种“运行时”的更改也一定从某种“编译期”的规则出发。
+
+所以我们可以认为：集群通信的实际形态都应该是“编译期”可确定的。
+
+此外，稍微思考可以发现：**对于集合通信，各个rank可以不同时开始，但是一定会同时结束**
+
+
+#### 集合通信原语
+
+我们来列举一下常见的集合通信原语有哪些吧，接下来假设存在rank $0,1,2,3$，分别为进程$P0, P1, P2, P3$
+
+##### Barrier
+
+rank $0,1,2,3$不传输数据，直接结束。
+
+类似进程里都有代码：
+```python
+barrier()
+```
+
+没传数据那能做什么？由于集合通信会同时结束，所以本质上这是一次进度同步，让四个rank的进程同步到某行指令
+
+##### BoardCast
+
+将rank $0,1,2,3$的其中一个rank的数据，广播到$0,1,2,3$，最后的结果是：rank $0,1,2,3$有同样的数据。
+
+![BoardCast](https://www.meemx.com/p/mpi-collective-communication/image-20250702234003965.png)
+
+
+##### Scatter
+
+将rank $0,1,2,3$的其中一个rank的数据，按顺序(一般是rank的数值顺序)分拆给其他rank。最后的结果是$0,1,2,3$分别有了其中的1/4
+
+![Scatter](https://www.meemx.com/p/mpi-collective-communication/image-20250702234124598.png)
+
+
+##### Gather
+
+将rank $0,1,2,3$各自的数据汇聚在一个rank里，最后的结果是，目标rank有了其他所有rank的数据，按数值顺序排列(其他rank无所谓结果)
+
+![Gather](https://www.meemx.com/p/mpi-collective-communication/image-20250702234303154.png)
+
+##### Reduce
+
+将rank $0,1,2,3$各自的数据**经过某种操作后**汇聚在一个rank里
+
+![Reduce](https://www.meemx.com/p/mpi-collective-communication/image-20250702235904162.png)
+
+可以发现和`Gather`非常像，区别在于**通信过程中**，多了一次“某种操作“。
+
+这种操作常见：Sum、Mul，即累加和累乘
+
+- 拓展问题：**通信过程中**，多了一次“某种操作“，意味着什么？
+
+##### All Gather
+
+简称`AG`
+
+可以理解为：把`Gather`的结果再`Boardcast`给所有rank。
+- 注意只是能这么理解，不是说实际上拆分成了这两种原语
+
+![All Gather](https://www.meemx.com/p/mpi-collective-communication/image-20250702234424578.png)
+
+##### All to All
+
+简称`A2A`
+
+rank $0, 1, 2, 3$各自把自己的数据拆成$n = 4$份，这样比如rank $0$的数据变为：`rank[0][0], rank[0][1], rank[0][2], rank[0][3]`，其他rank类似。
+
+我们用`rank[i][j]`表示rank $i$的第$j$份数据。
+
+`A2A`的做法是，让每个`rank[i][j]`都变成`rank[j][i]`
+
+聪明的你可能发现了，我们的矩阵转置就是这个过程，但A2A不局限于二维矩阵转置：即每份数据不一定是一个元素。
+
+![All to All](https://www.meemx.com/p/mpi-collective-communication/image-20250702234451492.png)
+
+##### ReduceScatter
+
+简称`RS`
+
+每个rank的数据分拆，然后每个rank做一次Reduce，再将结果置于分拆后的对应位置。
+
+![ReduceScatter](https://www.meemx.com/p/mpi-collective-communication/image-20250702235322061.png)
+
+##### All Reduce
+
+简称`AR`
+
+和`Gather` / `All Gather`的关系同理，可以理解成是把`Reduce`的结果`Boardcast`一遍
+- 注意只是能这么理解，不是说实际上拆分成了这两种原语
+
+注意，既然有`Reduce`，所以也带有“某种操作“
+
+![All Reduce](https://www.meemx.com/p/mpi-collective-communication/image-20250702235654609.png)
+
+#### Torch中怎么使用集合通信
+
 TODO
 
 ### 3D并行
