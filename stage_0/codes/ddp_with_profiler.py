@@ -24,12 +24,12 @@ def build_model(num_classes: int = 10) -> nn.Module:
     return model
 
 
-def get_datasets_ddp(data_dir: str, rank: int):
+def get_datasets_ddp(data_dir: str, local_rank: int):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),
     ])
-    if rank == 0:
+    if local_rank == 0:
         train_dataset = datasets.MNIST(root=data_dir, train=True, transform=transform, download=True)
         test_dataset = datasets.MNIST(root=data_dir, train=False, transform=transform, download=True)
         dist.barrier()
@@ -44,6 +44,7 @@ def get_datasets_ddp(data_dir: str, rank: int):
 def setup_dist():
     # ----------  缺变量时自动补单机单卡 ----------
     os.environ.setdefault("RANK",        "0")
+    os.environ.setdefault("LOCAL_RANK",  "0")
     os.environ.setdefault("WORLD_SIZE",  "1")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "12355")
@@ -129,7 +130,7 @@ def main():
     _, rank, world_size, local_rank, device = setup_dist()
     pin_memory = device.type == "cuda"
 
-    train_dataset, _ = get_datasets_ddp(args.data_dir, rank)
+    train_dataset, _ = get_datasets_ddp(args.data_dir, local_rank)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.num_workers, pin_memory=pin_memory)
 
