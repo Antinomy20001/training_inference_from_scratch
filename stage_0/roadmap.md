@@ -204,7 +204,526 @@ TODO
 
 ### 集合通信
 
-TODO
+我们在profiler里看到了`ncclDevKernel_AllReduce_Sum_f32_RING_LL`这个kernel，显然有格式：
+- `ncclDevKernel`: 我们忽略DevKernel，`nccl`是NVIDIA Collective Communications Library，是NVIDIA在NV GPU上的集合通信库，所以这个kernel来自这个集合通信库
+- `AllReduce`：这是一种通信原语，表示这个kernel执行的是这种通信原语。**后面的都是这个原语的参数**
+    - `Sum`： 求和，为什么这里有个求和呢？
+    - `f32`：显然是数据类型fp32，但为什么这里有个数据类型？
+    - `RING`：为什么有“环“这个词出现？
+    - `LL`：我可以先剧透，这个简称是指Low Latency，但这具体是什么呢？
+
+`nccl`看起来就是个名词，没什么好说的，但是`AllReduce`这种通信原语是什么呢，通信原语有哪些呢，以及，什么叫“集合通信“呢？为什么有“集合“两个字？
+
+#### 必要概念
+
+以目前的实践方式来说，我们会默认：
+- 一个`gpu` = 一个`进程`(实践上) = 一个`rank` = 一个`device`
+- 一个`机器` = 一个`Node` = 若干个`gpu`（一般是8-10）
+- 一个`集群` = 若干`机器` + 机器之间的网络拓扑 + 每个机器的device之间的网络拓扑
+
+rank是指gpu中的编号，比如有n张卡，那么rank范围是$[0, n)$，同时这里的$n$也是world size
+
+所以一个rank也会区分是“全部机器的全部gpu”的`global rank`，还有本地机器的`local rank`，默认我们都认为`rank = global rank`
+
+此外，在一些场景中需要计算某个`Node`在所有`Node`中的编号，再计算出实际的`device`的`rank`，所以也会有`node rank`，但总之，没有特意指明时，`rank`就是`device`的`global rank`
+
+#### 集合通信与点对点通信
+
+我们熟悉的通信比如socket，会有send和recv，我们把这样的通信称为：`点对点通信 (P2P)`，只需要两者约定好即可，像是游戏里的私聊。
+
+所谓的集合通信，是指有多个通信参与者，约定好一个通信原语，完成后各自获得某种结果。
+
+就像：有多个人，预定了一个聊天室，约定了一个讨论内容，每人完成自己负责的部分，最后大家拿着讨论结果走人。
+
+注意我们接下来默认：一个通信参与者 = 一个rank = 一个进程
+
+- 点对点通信：rank $i$明确发送信息给rank $j$，rank $j$明确的接受从rank $i$发送的信息
+
+例如同一时间，rank $i$的进程中明确执行了代码：
+
+```python
+send(message, j)
+```
+
+而rank $j$的进程明确的执行了代码：
+
+```python
+message = recv(i)
+```
+
+
+- 集合通信：rank $i,j,k,z$约定一起参与通信，每个rank的进程都会负责同样的发送或者接受的行为顺序，最后rank $i,j,k,z$都获得了这种约定的结果。
+
+比如rank $i,k,k,z$的进程都执行了代码：
+
+```python
+result = collective_communication_op(message, [i, j, k, z])
+```
+
+所以我们在coding时需要预先设置好：
+
+- 点对点通信的规则
+- 参与集合通信的rank集合，以及约定了什么样的通信
+
+这是类似“编译期”需要指定的内容，如果有“运行时”的更改，那么也需要通过通信机制让所有进程感知，但这种“运行时”的更改也一定从某种“编译期”的规则出发。
+
+所以我们可以认为：集群通信的实际形态都应该是“编译期”可确定的。
+
+此外，稍微思考可以发现：**对于集合通信，各个rank可以不同时开始，但是一定会同时结束**
+
+
+#### 集合通信原语
+
+我们来列举一下常见的集合通信原语有哪些吧，接下来假设存在rank $0,1,2,3$，分别为进程$P0, P1, P2, P3$
+
+##### Barrier
+
+rank $0,1,2,3$不传输数据，直接结束。
+
+类似进程里都有代码：
+```python
+barrier()
+```
+
+没传数据那能做什么？由于集合通信会同时结束，所以本质上这是一次进度同步，让四个rank的进程同步到某行指令
+
+##### BroadCast
+
+将rank $0,1,2,3$的其中一个rank的数据，广播到$0,1,2,3$，最后的结果是：rank $0,1,2,3$有同样的数据。
+
+![BroadCast](https://www.meemx.com/p/mpi-collective-communication/image-20250702234003965.png)
+
+
+##### Scatter
+
+将rank $0,1,2,3$的其中一个rank的数据，按顺序(一般是rank的数值顺序)分拆给其他rank。最后的结果是$0,1,2,3$分别有了其中的1/4
+
+![Scatter](https://www.meemx.com/p/mpi-collective-communication/image-20250702234124598.png)
+
+
+##### Gather
+
+将rank $0,1,2,3$各自的数据汇聚在一个rank里，最后的结果是，目标rank有了其他所有rank的数据，按数值顺序排列(其他rank无所谓结果)
+
+![Gather](https://www.meemx.com/p/mpi-collective-communication/image-20250702234303154.png)
+
+##### Reduce
+
+将rank $0,1,2,3$各自的数据**经过某种操作后**汇聚在一个rank里
+
+![Reduce](https://www.meemx.com/p/mpi-collective-communication/image-20250702235904162.png)
+
+可以发现和`Gather`非常像，区别在于**通信过程中**，多了一次“某种操作“。
+
+这种操作常见：Sum、Mul，即累加和累乘
+
+- 拓展问题：**通信过程中**，多了一次“某种操作“，意味着什么？
+
+##### All Gather
+
+简称`AG`
+
+可以理解为：把`Gather`的结果再`BroadCast`给所有rank。
+- 注意只是能这么理解，不是说实际上拆分成了这两种原语
+
+![All Gather](https://www.meemx.com/p/mpi-collective-communication/image-20250702234424578.png)
+
+##### All to All
+
+简称`A2A`
+
+rank $0, 1, 2, 3$各自把自己的数据拆成$n = 4$份，这样比如rank $0$的数据变为：`rank[0][0], rank[0][1], rank[0][2], rank[0][3]`，其他rank类似。
+
+我们用`rank[i][j]`表示rank $i$的第$j$份数据。
+
+`A2A`的做法是，让每个`rank[i][j]`都变成`rank[j][i]`
+
+聪明的你可能发现了，我们的矩阵转置就是这个过程，但A2A不局限于二维矩阵转置：即每份数据不一定是一个元素。
+
+![All to All](https://www.meemx.com/p/mpi-collective-communication/image-20250702234451492.png)
+
+##### ReduceScatter
+
+简称`RS`
+
+每个rank的数据分拆，然后每个rank做一次Reduce，再将结果置于分拆后的对应位置。
+
+![ReduceScatter](https://www.meemx.com/p/mpi-collective-communication/image-20250702235322061.png)
+
+##### All Reduce
+
+简称`AR`
+
+和`Gather` / `All Gather`的关系同理，可以理解成是把`Reduce`的结果`BroadCast`一遍
+- 注意只是能这么理解，不是说实际上拆分成了这两种原语
+
+注意，既然有`Reduce`，所以也带有“某种操作“
+
+![All Reduce](https://www.meemx.com/p/mpi-collective-communication/image-20250702235654609.png)
+
+#### Torch中怎么使用集合通信
+
+在PyTorch中，集合通信主要通过torch.distributed模块实现。下面我们将详细介绍如何在PyTorch中使用各种集合通信原语。
+在使用集合通信之前，需要先初始化分布式环境。
+
+```python
+
+def setup_process(rank, world_size, backend):
+    """
+    初始化分布式环境
+
+    参数:
+        rank: 当前进程的rank
+        world_size: 总进程数
+        backend: 指定后端 ('gloo', 'nccl')
+
+    返回:
+        rank, world_size, pid
+    """
+    # 设置通信地址
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+
+    # 跨平台网络接口设置 (仅Gloo需要)
+    if backend == 'gloo':
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            os.environ['GLOO_SOCKET_IFNAME'] = 'lo0'
+        elif system == "Linux":
+            os.environ['GLOO_SOCKET_IFNAME'] = 'lo'
+        # Windows不需要设置
+
+    # 初始化进程组
+    dist.init_process_group(
+        backend=backend,
+        rank=rank,
+        world_size=world_size
+    )
+
+    # 如果使用NCCL，设置GPU设备
+    if backend == 'nccl':
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL backend requested but CUDA is not available")
+        # 单GPU情况下，所有rank共享同一个GPU
+        # 多GPU情况下，每个rank使用不同的GPU
+        if torch.cuda.device_count() >= world_size:
+            torch.cuda.set_device(rank % torch.cuda.device_count())
+        else:
+            torch.cuda.set_device(0)
+
+    return rank, world_size, os.getpid(), backend
+
+
+
+```
+
+1. Broadcast
+
+    将指定rank的数据广播到所有进程。
+
+```python
+
+def run_broadcast(rank, world_size):
+    """
+    Broadcast操作：rank0的数据广播到所有进程
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before broadcast: tensor([[10., 10., 10.], [10., 10., 10.], [10., 10., 10.]])
+    Rank 1 (pid: 12346) of 3: Before broadcast: tensor([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    Rank 2 (pid: 12347) of 3: Before broadcast: tensor([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    Rank 0 (pid: 12345) of 3: After broadcast: tensor([[10., 10., 10.], [10., 10., 10.], [10., 10., 10.]])
+    Rank 1 (pid: 12346) of 3: After broadcast: tensor([[10., 10., 10.], [10., 10., 10.], [10., 10., 10.]])
+    Rank 2 (pid: 12347) of 3: After broadcast: tensor([[10., 10., 10.], [10., 10., 10.], [10., 10., 10.]])
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 只有rank 0有初始数据
+    tensor = torch.ones(3, 3) * (10 if rank == 0 else 0)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before broadcast: {tensor}")
+
+    # 从rank 0广播数据
+    dist.broadcast(tensor, src=0)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: After broadcast: {tensor}")
+
+    cleanup()
+
+```
+
+2. Scatter
+
+    将数据从一个rank分散到所有rank。
+
+```python
+
+
+def run_scatter(rank, world_size):
+    """
+    Scatter操作：rank0的数据分散到所有进程
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before scatter: tensor([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    Rank 1 (pid: 12346) of 3: Before scatter: tensor([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    Rank 2 (pid: 12347) of 3: Before scatter: tensor([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    Rank 0 (pid: 12345) of 3: After scatter: tensor([[1., 1., 1.], [1., 1., 1.], [1., 1., 1.]])
+    Rank 1 (pid: 12346) of 3: After scatter: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+    Rank 2 (pid: 12347) of 3: After scatter: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 准备接收张量
+    recv_tensor = torch.zeros(3, 3)
+
+    # 只有rank 0准备发送数据
+    if rank == 0:
+        send_tensors = [torch.ones(3, 3) * (i + 1) for i in range(world_size)]
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: Before scatter: {recv_tensor}")
+    else:
+        send_tensors = None
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: Before scatter: {recv_tensor}")
+
+    # 执行scatter
+    dist.scatter(recv_tensor, send_tensors, src=0)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: After scatter: {recv_tensor}")
+
+    cleanup()
+
+
+```
+
+3. Gather
+
+    将所有rank的数据收集到一个指定的rank
+
+```python
+
+def run_gather(rank, world_size):
+    """
+    Gather操作：所有rank的数据收集到rank0
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before gather: tensor([[1., 1., 1.], [1., 1., 1.], [1., 1., 1.]])
+    Rank 1 (pid: 12346) of 3: Before gather: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+    Rank 2 (pid: 12347) of 3: Before gather: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    Rank 0 (pid: 12345) of 3: After gather - Received tensors:
+        Rank 0 data: tensor([[1., 1., 1.], [1., 1., 1.], [1., 1., 1.]])
+        Rank 1 data: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+        Rank 2 data: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    Rank 1 (pid: 12346) of 3: After gather: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+    Rank 2 (pid: 12347) of 3: After gather: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 每个rank准备自己的数据
+    send_tensor = torch.ones(3, 3) * (rank + 1)
+
+    # 只有rank 0准备接收缓冲区
+    recv_tensors = [torch.zeros(3, 3) for _ in range(world_size)] if rank == 0 else None
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before gather: {send_tensor}")
+
+    # 执行gather
+    dist.gather(send_tensor, recv_tensors, dst=0)
+
+    if rank == 0:
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: After gather - Received tensors:")
+        for i, tensor in enumerate(recv_tensors):
+            print(f"    Rank {i} data: {tensor}")
+    else:
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: After gather: {send_tensor}")
+
+    cleanup()
+
+```
+
+4. Reduce
+
+    将所有rank的数据通过指定操作归约到一个rank。
+```python
+
+def run_reduce(rank, world_size):
+    """
+    Reduce操作：所有rank的数据归约到rank0
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before reduce: tensor([[1., 1., 1.], [1., 1., 1.], [1., 1., 1.]])
+    Rank 1 (pid: 12346) of 3: Before reduce: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+    Rank 2 (pid: 12347) of 3: Before reduce: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    Rank 0 (pid: 12345) of 3: After reduce (sum result): tensor([[6., 6., 6.], [6., 6., 6.], [6., 6., 6.]])
+    Rank 1 (pid: 12346) of 3: After reduce: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]]) (unchanged)
+    Rank 2 (pid: 12347) of 3: After reduce: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]]) (unchanged)
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 每个rank准备自己的数据
+    tensor = torch.ones(3, 3) * (rank + 1)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before reduce: {tensor}")
+
+    # 执行reduce，将结果保存到rank 0
+    dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+
+    if rank == 0:
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: After reduce (sum result): {tensor}")
+    else:
+        print(f"Rank {rank} (pid: {pid}) of {world_size}: After reduce: {tensor} (unchanged)")
+
+    cleanup()
+
+```
+
+5. All Gather
+    
+    将所有rank的数据收集到所有rank
+```python
+
+def run_all_gather(rank, world_size):
+    """
+    All Gather操作：所有rank的数据收集到所有rank
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before all_gather: tensor([1., 1.])
+    Rank 1 (pid: 12346) of 3: Before all_gather: tensor([2., 2.])
+    Rank 2 (pid: 12347) of 3: Before all_gather: tensor([3., 3.])
+    Rank 0 (pid: 12345) of 3: After all_gather - Received all tensors:
+        Rank 0 data: tensor([1., 1.])
+        Rank 1 data: tensor([2., 2.])
+        Rank 2 data: tensor([3., 3.])
+    Rank 1 (pid: 12346) of 3: After all_gather - Received all tensors:
+        Rank 0 data: tensor([1., 1.])
+        Rank 1 data: tensor([2., 2.])
+        Rank 2 data: tensor([3., 3.])
+    Rank 2 (pid: 12347) of 3: After all_gather - Received all tensors:
+        Rank 0 data: tensor([1., 1.])
+        Rank 1 data: tensor([2., 2.])
+        Rank 2 data: tensor([3., 3.])
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 每个rank准备自己的数据
+    send_tensor = torch.ones(2) * (rank + 1)
+
+    # 准备接收缓冲区
+    recv_tensors = [torch.zeros(2) for _ in range(world_size)]
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before all_gather: {send_tensor}")
+
+    # 执行all_gather
+    dist.all_gather(recv_tensors, send_tensor)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: After all_gather - Received all tensors:")
+    for i, tensor in enumerate(recv_tensors):
+        print(f"    Rank {i} data: {tensor}")
+
+    cleanup()
+
+```
+
+6. All to All
+
+    每个rank将数据分块并交换给其他rank。
+```python
+def run_all_to_all(rank, world_size):
+    """
+    ⚠️ 重要警告：
+    Gloo 后端 (CPU) 不支持 all_to_all 操作！
+    此操作仅在 NCCL (GPU) 或 MPI 后端可用。
+    
+    替代方案：
+    1. 使用 GPU + NCCL 后端运行
+    2. 用 send/recv 组合实现类似功能
+    3. 跳过此操作，使用其他集合通信
+    
+    预期输出（如果支持，3个rank）：
+    Rank 0: Before all_to_all - Send data: [tensor([0., 0.]), tensor([1., 1.]), tensor([2., 2.])]
+    Rank 1: Before all_to_all - Send data: [tensor([3., 3.]), tensor([4., 4.]), tensor([5., 5.])]
+    Rank 2: Before all_to_all - Send data: [tensor([6., 6.]), tensor([7., 7.]), tensor([8., 8.])]
+    Rank 0: After all_to_all - Received data: [tensor([0., 0.]), tensor([3., 3.]), tensor([6., 6.])]
+    Rank 1: After all_to_all - Received data: [tensor([1., 1.]), tensor([4., 4.]), tensor([7., 7.])]
+    Rank 2: After all_to_all - Received data: [tensor([2., 2.]), tensor([5., 5.]), tensor([8., 8.])]
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+    
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: ⚠️ Gloo backend does not support all_to_all operation!")
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: This operation requires NCCL (GPU) or MPI backend.")
+    
+    cleanup()
+
+
+```
+
+
+7. ReduceScatter
+
+    先归约再分散，每个rank只得到部分结果。
+
+```python
+def run_reduce_scatter(rank, world_size):
+    """
+    ReduceScatter操作：先归约再分散，每个rank只得到部分结果
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before reduce_scatter - Input: [tensor([1., 1.]), tensor([2., 2.]), tensor([3., 3.])]
+    Rank 1 (pid: 12346) of 3: Before reduce_scatter - Input: [tensor([2., 2.]), tensor([3., 3.]), tensor([4., 4.])]
+    Rank 2 (pid: 12347) of 3: Before reduce_scatter - Input: [tensor([3., 3.]), tensor([4., 4.]), tensor([5., 5.])]
+    Rank 0 (pid: 12345) of 3: After reduce_scatter - Output: tensor([6., 6.])  # (1+2+3)
+    Rank 1 (pid: 12346) of 3: After reduce_scatter - Output: tensor([9., 9.])  # (2+3+4)
+    Rank 2 (pid: 12347) of 3: After reduce_scatter - Output: tensor([12., 12.]) # (3+4+5)
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 每个rank准备完整的数据
+    input_tensors = [torch.ones(2) * (rank + 1 + i) for i in range(world_size)]
+    output_tensor = torch.zeros(2)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before reduce_scatter - Input: {input_tensors}")
+
+    # 执行reduce_scatter
+    dist.reduce_scatter(output_tensor, input_tensors, op=dist.ReduceOp.SUM)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: After reduce_scatter - Output: {output_tensor}")
+
+    cleanup()
+
+```
+
+
+8. All Reduce
+    
+    将所有rank的数据归约后广播给所有rank。
+
+```python
+
+def run_all_reduce(rank, world_size):
+    """
+    All Reduce操作：所有rank的数据归约后广播给所有rank
+
+    预期输出（3个rank）：
+    Rank 0 (pid: 12345) of 3: Before all_reduce: tensor([[1., 1., 1.], [1., 1., 1.], [1., 1., 1.]])
+    Rank 1 (pid: 12346) of 3: Before all_reduce: tensor([[2., 2., 2.], [2., 2., 2.], [2., 2., 2.]])
+    Rank 2 (pid: 12347) of 3: Before all_reduce: tensor([[3., 3., 3.], [3., 3., 3.], [3., 3., 3.]])
+    Rank 0 (pid: 12345) of 3: After all_reduce (sum): tensor([[6., 6., 6.], [6., 6., 6.], [6., 6., 6.]])
+    Rank 1 (pid: 12346) of 3: After all_reduce (sum): tensor([[6., 6., 6.], [6., 6., 6.], [6., 6., 6.]])
+    Rank 2 (pid: 12347) of 3: After all_reduce (sum): tensor([[6., 6., 6.], [6., 6., 6.], [6., 6., 6.]])
+    """
+    rank, world_size, pid = setup_process(rank, world_size)
+
+    # 每个rank准备自己的数据
+    tensor = torch.ones(3, 3) * (rank + 1)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: Before all_reduce: {tensor}")
+
+    # 执行all_reduce
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    print(f"Rank {rank} (pid: {pid}) of {world_size}: After all_reduce (sum): {tensor}")
+
+    cleanup()
+
+```
+
 
 ### 3D并行
 
