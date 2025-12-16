@@ -37,7 +37,6 @@ def get_datasets_ddp(data_dir: str, local_rank: int):
         test_dataset = datasets.MNIST(root=data_dir, train=False, transform=transform, download=False)
     return train_dataset, test_dataset
 
-
 def setup_dist():
     # ----------  缺变量时自动补单机单卡 ----------
     os.environ.setdefault("RANK",        "0")
@@ -59,9 +58,7 @@ def setup_dist():
     return backend, rank, world_size, local_rank, device
 
 
-
 def train_one_epoch(model, loader, criterion, optimizer, device):
-
     model.train()
     running_loss = 0.0
     correct = 0
@@ -81,7 +78,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         _, preds = torch.max(outputs, 1)
         correct += (preds == targets).sum().item()
         total   += targets.size(0)
-
 
     avg_loss = running_loss / max(total, 1)
     acc      = correct / max(total, 1)
@@ -155,6 +151,7 @@ def main():
         if rank == 0:
             print(f"Epoch {epoch}/{args.epochs} | loss {train_loss:.4f} "
                   f"| train_acc {train_acc:.4f} | test_acc {test_acc:.4f}")
+
     if rank == 0:
         os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
         torch.save(ddp_model.module.state_dict(), args.save_path)
