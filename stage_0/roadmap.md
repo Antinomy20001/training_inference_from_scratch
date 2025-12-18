@@ -200,7 +200,20 @@ cpu活动中会有我们这份代码中ddp的详细堆栈，我们可以放大�
 
 ### GPU的基本概念
 
-TODO
+学习文章：
+- [GPU概念](https://zhuanlan.zhihu.com/p/1976675217926543141)，直到4.6之前，不包括4.6
+- [CUDA Stream](https://zhuanlan.zhihu.com/p/699754357)
+- [GPU通信](https://www.armcvai.cn/2023-08-10/gpu-nvlink.html)
+- 对于GPU基础知识，基本上可以相信ai的解答
+
+
+看完后至少理解了：
+- CUDA Stream
+- CPU和GPU协作的模式：Launch Kernel到Stream，Stream中的Kernel被schedule调度到SM执行
+- CUDA Core，Tensor Core
+- GPU上以Warp为最小调度计算单位
+- GPU的物理计算单元叫SM，SM有自己的硬件资源（RF/L1/L2/SRAM）
+- CPU/GPU通信
 
 ### 集合通信
 
