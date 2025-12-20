@@ -738,6 +738,164 @@ def run_all_reduce(rank, world_size):
 ```
 
 
+
+### 进程组：
+
+
+在点对点（P2P）通信中，进程组的核心价值是为 `send`/`recv` 操作提供**逻辑作用域、命名隔离和连接优化**。它不直接参与通信聚合，但决定了“谁可以与谁通信”以及“如何标识对方”。
+
+---
+
+#### 1. **逻辑地址空间：消除全局 Rank 歧义**
+
+- P2P 通信的 `dst` 和 `src` 参数是**组内局部 Rank**，而非全局 Rank。
+- 这避免了多通道通信时的编号冲突，提升代码可维护性。
+
+**示例**：在子组 `G = [2,5]` 中，`全局 rank 2` 的进程在组内被标识为 `local rank 0`，`全局 rank 5` 为 `local rank 1`。通信时直接使用 `dst=1` 即可指向 `rank 5`。
+
+**实际价值**：清晰区分不同通信逻辑的地址空间，防止误发。
+
+---
+
+#### 2. **通信隔离与多后端支持**
+
+即使没有集合操作，训练任务中也可能并存多种 P2P 流（激活、梯度、控制信号）。通过独立进程组可实现：
+
+- **逻辑隔离**：不同语义使用不同组（如 `act_group`, `ctrl_group`）
+- **后端差异化**：NCCL 传输 GPU 张量，Gloo 处理 CPU 控制消息
+- **合法性约束**：仅组内进程可互相通信，跨组操作将报错
+
+**实际价值**：防止向非目标进程误发数据，尤其适用于多角色进程混布场景。
+
+---
+
+#### 3. **硬件拓扑感知：按需建立连接**
+
+`new_group()` 初始化时会触发底层连接建立：
+- **NCCL**：调用 `ncclCommInitRank` 为组内进程两两创建 P2P 连接
+- **Gloo**：构建组内连接图
+
+因此，**仅包含邻接设备的子组**（如 NVLink 直连的 GPU 环）可减少无效连接开销，加速初始化。
+
+**实际价值**：大规模集群中避免全连接，提升启动效率与稳定性。
+
+---
+
+### 代码实现
+
+#### 基础点对点通信（子进程组）
+
+```python
+import torch
+import torch.distributed as dist
+import os
+
+def main():
+    # 初始化全局环境（假设 4 进程）
+    dist.init_process_group(backend='nccl', init_method='env://')
+    rank = dist.get_rank()
+
+    # 创建子组：偶数 rank 和奇数 rank 分离
+    even_ranks = [0, 2]
+    odd_ranks  = [1, 3]
+    even_group = dist.new_group(ranks=even_ranks)  # 所有进程必须参与创建
+    odd_group  = dist.new_group(ranks=odd_ranks)   # 否则会死锁
+
+    device = torch.device(f'cuda:{rank}')
+    tensor = torch.ones(2, device=device) * rank
+
+    # 偶数组：rank 0 → rank 2
+    if rank in even_ranks:
+        local_rank = dist.get_rank(group=even_group)
+        if local_rank == 0:
+            dist.send(tensor, dst=1, group=even_group)  # dst 1 对应全局 rank 2
+            print(f"[Rank {rank}] Sent to even-group peer")
+        else:  # local_rank == 1
+            recv_tensor = torch.zeros_like(tensor)
+            dist.recv(recv_tensor, src=0, group=even_group)
+            print(f"[Rank {rank}] Received: {recv_tensor}")
+
+    # 奇数组：rank 1 → rank 3
+    elif rank in odd_ranks:
+        local_rank = dist.get_rank(group=odd_group)
+        if local_rank == 0:
+            dist.send(tensor, dst=1, group=odd_group)  # dst 1 对应全局 rank 3
+            print(f"[Rank {rank}] Sent to odd-group peer")
+        else:  # local_rank == 1
+            recv_tensor = torch.zeros_like(tensor)
+            dist.recv(recv_tensor, src=0, group=odd_group)
+            print(f"[Rank {rank}] Received: {recv_tensor}")
+
+    dist.destroy_process_group()
+```
+
+**⚠️ 关键约束**：
+- `dst`/`src` 必须是**组内相对 rank**。
+- **所有进程**必须调用 `new_group()`，即使它不属于该组（否则集体操作会死锁）。
+- 张量设备必须与后端匹配（NCCL → GPU）。
+
+---
+
+#### 异步点对点通信
+
+```python
+def async_p2p_example():
+    dist.init_process_group(backend='nccl')
+    rank = dist.get_rank()
+    device = torch.device(f'cuda:{rank}')
+    group = dist.group.WORLD
+
+    tensor = torch.tensor([rank * 1.0], device=device)
+
+    if rank == 0:
+        req = dist.isend(tensor, dst=1, group=group)
+        # 重叠计算与通信
+        # ... 计算任务 ...
+        req.wait()  # 确保发送完成
+    elif rank == 1:
+        recv_tensor = torch.zeros_like(tensor)
+        req = dist.irecv(recv_tensor, src=0, group=group)
+        # ... 其他计算 ...
+        req.wait()
+        print(f"[Rank {rank}] Received: {recv_tensor.item()}")
+```
+
+**✅ 优势**：实现通信与计算重叠，提升整体吞吐。
+
+---
+
+#### 多通道隔离：不同后端并行
+
+##### 方案设计
+
+**目标**：在 4 进程环境中，同时运行两个独立的 all-to-all 操作：
+
+- **GPU 组**：所有 ranks `[0,1,2,3]`，使用 **NCCL** 后端传输 GPU 张量
+- **CPU 组**：仅偶数 ranks `[0,2]`，使用 **Gloo** 后端传输 CPU 张量
+
+详细代码查看mult_channel_all2all.py
+
+**✅ 设计要点**：
+
+- **后端异构**：同一组进程可针对不同通信模式使用最优后端。
+
+---
+
+####  核心小结
+
+| 功能 | 点对点场景下的价值 |
+|------|-------------------|
+| **逻辑命名** | 提供局部 rank 地址空间，避免全局编号混乱 |
+| **隔离性** | 仅组内进程可合法通信，防止误操作 |
+| **资源优化** | 按需建立底层连接，适配硬件拓扑 |
+| **多通道** | 支持不同语义流使用独立组与后端，便于管理调试 |
+
+> **核心原则**：进程组是点对点通信的**安全围栏**和**命名上下文**。它不直接参与数据聚合，但为结构化、可维护的大规模分布式训练提供了基础保障。
+
+---
+
+
+
 ### 3D并行
 
 TODO
