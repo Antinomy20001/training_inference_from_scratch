@@ -740,7 +740,239 @@ def run_all_reduce(rank, world_size):
 
 ### 3D并行
 
-TODO
+说到并行，我们先要和并发的概念区分开，并行和并发的区别请自行询问AI。
+
+然后，我们还需要进一步明确Latency和吞吐这两种不同的性能指标，也请自行询问AI，需要确保充分理解Latency和吞吐之间的关系。
+
+无论是训练还是推理，我们面对的都是这样一个问题：
+
+有N张某拓扑下的卡，有M个的待计算任务（输入数据），我们希望充分使用这N张卡来跑完这些输入数据。
+
+考虑我们后端常见的做法，比如写一个爬虫，有M个URL和N个线程，我们可以很自然的想到让N个线程分别处理这M个URL
+
+上面这种做法，叫做**数据并行**，数据并行也是非常好理解的一种并行方式。
+
+再考虑我们的AI模型，假设模型就是若干个矩阵乘法，显然我们的数据并行并不能真的让单个计算任务被加速，那么可以很自然的想到：
+
+**能不能让多张卡共同参与一个计算，让单个计算被加快呢？**
+
+这个过程叫做**模型并行**，即同一个模型实例被多张卡并行处理，从而降低单次计算的latency
+
+那么更进一步，怎样让多张卡共同参与一个计算呢？
+
+假设我们的模型是4个矩阵乘法（4个`torch.nn.Linear`），我们也有4张卡：
+1. 让4张卡共同完成每一个矩阵乘法，每个矩阵乘法都分成四份，大家计算完之后再汇总
+2. 让卡0完成矩阵乘法0，卡1完成矩阵乘法1, ....
+
+第1种对应的就是 **TP（Tensor Parallel，张量并行）**：
+
+#### TP（张量并行）例子：把一个`Linear`拆到多张卡上算
+
+以一个最简单的线性层为例：
+
+`y = x W`，其中`x`形状是`[B, d_in]`，`W`形状是`[d_in, d_out]`，输出`y`是`[B, d_out]`。
+
+如果有4张卡，我们可以把`W`按列切成4块（把`d_out`拆开）：
+
+- 卡0拿`W0: [d_in, d_out/4]`，算`y0 = x W0`，得到`[B, d_out/4]`
+- 卡1拿`W1`，算`y1 = x W1`
+- 卡2拿`W2`，算`y2 = x W2`
+- 卡3拿`W3`，算`y3 = x W3`
+
+此时每张卡都只算了输出的一部分，最后把`y0..y3`在最后一维拼起来（一次`all-gather`/拼接），得到完整的`y`。
+
+直观感受：
+
+- 好处：单个`Linear`的计算量被4张卡分摊，计算更快
+- 代价：每个需要TP的算子/层都会引入一次或多次跨卡通信（比如`all-gather`、`all-reduce`）
+
+如果把这件事放回到Transformer里，你可以把它理解成：同一层里的大矩阵（比如注意力里的投影、MLP里的两层大`Linear`）被切碎分到多张卡，大家一起算完再把结果汇总。
+
+下面给一个最小的Torch示例（演示“按列切分 + `all_gather`拼回”这个动作）：
+
+```python
+import os
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def main():
+    # CPU跑就行
+    dist.init_process_group(backend="gloo")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    device = torch.device("cpu")
+
+    torch.manual_seed(0)
+    B, d_in, d_out = 2, 8, 12
+    assert d_out % world_size == 0
+    shard = d_out // world_size
+
+    x = torch.randn(B, d_in, device=device)
+    linear = nn.Linear(d_in, d_out, bias=True).to(device)
+
+    # 切分模型参数，每个卡只负责其中的一部分
+    start = rank * shard
+    end = start + shard
+    weight_local = linear.weight[start:end, :].contiguous()
+    bias_local = linear.bias[start:end].contiguous()
+
+    y_local = F.linear(x, weight_local, bias_local)
+
+    y_parts = [torch.empty(B, shard, device=device) for _ in range(world_size)]
+    # 做一次AG再拼起来结果
+    dist.all_gather(y_parts, y_local)
+    y = torch.cat(y_parts, dim=-1)
+
+    # 对拍一下单卡的结果
+    y_ref = linear(x)
+    err = (y - y_ref).abs().max()
+
+    if rank == 0:
+        print("max_abs_err:", float(err))
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+用法（4卡）：
+
+`torchrun --standalone --nproc_per_node 4 tp_linear_demo.py`
+
+第2种对应的就是 **PP（Pipeline Parallel，流水线并行）**：
+
+#### PP（流水线并行）例子：把不同层分给不同卡
+
+继续用4个`Linear`：
+
+`h1 = f0(x)`（第0层） → `h2 = f1(h1)`（第1层） → `h3 = f2(h2)`（第2层） → `y = f3(h3)`（第3层）
+
+如果有4张卡，可以这样分：
+
+- 卡0跑第0层`f0`
+- 卡1跑第1层`f1`
+- 卡2跑第2层`f2`
+- 卡3跑第3层`f3`
+
+对**单个输入**来说，它还是要从卡0一路“传递”到卡3，本质是串行，所以单条请求的延迟不一定会变小。
+
+PP真正发挥作用的关键是 **micro-batch**：把一批大的batch切成多个小batch，让不同卡在不同时间处理不同micro-batch，从而形成“流水线”，这样的效果一方面可以提高吞吐，另一方面也可以让模型持续的产生该batch的结果。
+
+<del>（其实4个矩阵乘法的例子不太能理解为什么能提高吞吐，但可以先记住这个结论。）</dev>
+
+举个最小的时间线例子：把一个batch切成4个micro-batch（`m1..m4`），那么前向的调度大致像这样（省略通信细节）：
+
+| 时间步 | 卡0 | 卡1 | 卡2 | 卡3 |
+| --- | --- | --- | --- | --- |
+| t1 | m1@L0 |  |  |  |
+| t2 | m2@L0 | m1@L1 |  |  |
+| t3 | m3@L0 | m2@L1 | m1@L2 |  |
+| t4 | m4@L0 | m3@L1 | m2@L2 | m1@L3 |
+| t5 |  | m4@L1 | m3@L2 | m2@L3 |
+| t6 |  |  | m4@L2 | m3@L3 |
+| t7 |  |  |  | m4@L3 |
+
+直观感受：
+
+- 好处：模型太大放不进一张卡时，PP可以按层拆分做内存扩展；吞吐也能靠流水线提高
+- 代价：跨stage要传激活（`send/recv`）；还会有“气泡”（t1~t3、t5~t7这种填充/排空阶段的空闲）
+    - 体系结构课上学过怎么计算气泡比例，可以自行计算一下PP的流水线由于这些气泡，可能产生什么问题
+    - 可以进一步思考，我们这个例子是fwd，在训练场景是有bwd的，fwd的计算顺序是m1->m2->m3->m4，bwd的计算顺序是m4->m3->m2->m1，你可以思考一下，这两个顺序会让这个流水线有什么新的问题
+
+训练推理的PP各有不同的特点，但直观上你可以先记住：PP的核心是“按层切 + micro-batch流水线”。
+
+下面给一个最小的Torch示例（4个stage + 4个micro-batch，只演示前向的流水线调度）：
+
+```python
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+
+def main():
+    dist.init_process_group(backend="gloo")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    device = torch.device("cpu")
+
+    torch.manual_seed(1000 + rank)
+    B, d, micro_batches = 2, 16, 4
+
+    stage_id = rank
+    f = nn.Linear(d, d).to(device)
+
+    recv_bufs = {}
+    recv_works = {}
+    send_works = []
+
+    total_steps = micro_batches + world_size - 1
+    for t in range(total_steps):
+        if rank > 0:
+            micro_prefetch = t - (rank - 1)
+            if 0 <= micro_prefetch < micro_batches:
+                buf = torch.empty(B, d, device=device)
+                work = dist.irecv(buf, src=rank - 1, tag=micro_prefetch)
+                recv_bufs[micro_prefetch] = buf
+                recv_works[micro_prefetch] = work
+
+        micro_compute = t - rank
+        if 0 <= micro_compute < micro_batches:
+            if rank == 0:
+                h = torch.randn(B, d, device=device)
+            else:
+                recv_works[micro_compute].wait()
+                h = recv_bufs.pop(micro_compute)
+                recv_works.pop(micro_compute)
+
+            h = f(h)
+
+            if rank < world_size - 1:
+                send_works.append(dist.isend(h, dst=rank + 1, tag=micro_compute))
+            else:
+                print("stage", stage_id, "micro", micro_compute, "mean", float(h.mean()))
+
+    for w in send_works:
+        w.wait()
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+用法（4卡，每卡一个stage）：
+
+`torchrun --standalone --nproc_per_node 4 pp_forward_demo.py`
+
+#### 3D并行（DP + TP + PP）怎么理解
+
+现实里经常会把三种并行叠在一起：
+
+- **DP**：复制模型，拆数据（不同卡/不同节点处理不同batch切片）
+- **TP**：同一层里的大矩阵拆到多张卡一起算
+- **PP**：不同层分到不同卡，通过micro-batch形成流水线
+
+所以“3D并行”的直观就是：
+
+1. 先用PP把模型按层分成几个stage
+2. 每个stage内部再用TP把大算子切碎
+3. 最外层用DP复制整套流水线（每套流水线吃不同数据）
+
+**综上所述，我们可以认为所谓的3D并行 = 数据并行 + 模型并行，其中模型并行包括TP和PP。**
+
+之后我们会遇到很多其他的并行方式，例如Context Parallel、Expert Parallel、Sequence Parallel等，但都可以认为是这3D并行的某种特化场景。
+
+3D并行也构成了分布式训练或推理的基本姿势：将任务按照N-D并行策略拆分、用通信互联，通信和计算重叠。
 
 ### huggingface
 
